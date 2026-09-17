@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>二胡姿態離線 GLB 3D 顯示</title>
+<style>
+:root{--bg:#08111c;--card:#121d2b;--line:#2b405b;--text:#eef5ff;--sub:#9eb3cf;--ok:#42d392;--bad:#ff6b6b;--warn:#ffd166}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#08111c,#0d1724);color:var(--text);font-family:Arial,"Microsoft JhengHei",sans-serif}.wrap{max-width:1180px;margin:auto;padding:14px}h1{font-size:24px;margin:6px 0 12px}.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:14px;margin-bottom:12px;box-shadow:0 8px 20px rgba(0,0,0,.22)}.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px}.kv{background:#0a1320;border:1px solid var(--line);border-radius:12px;padding:10px}.k{font-size:13px;color:var(--sub)}.v{font-size:22px;font-weight:700;margin-top:6px}.small{font-size:13px;color:var(--sub);line-height:1.6}button{background:#24527d;color:white;border:none;border-radius:12px;padding:10px 14px;font-size:15px;cursor:pointer}.ok{color:var(--ok)}.bad{color:var(--bad)}.pill{display:inline-block;border:1px solid var(--line);background:#0a1320;border-radius:999px;padding:7px 10px}.warn{color:var(--warn)}#stage{width:100%;height:640px;background:#06101b;border:1px solid var(--line);border-radius:14px;overflow:hidden;position:relative}canvas{display:block;width:100%;height:100%}#overlay{position:absolute;left:14px;top:12px;font:15px Arial,"Microsoft JhengHei";color:#eef5ff;text-shadow:0 1px 4px #000;line-height:1.8;z-index:2}#loadMsg{position:absolute;inset:0;display:grid;place-items:center;text-align:center;color:var(--sub);padding:20px;z-index:3;background:rgba(3,8,14,.74)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>二胡姿態離線 GLB 3D 顯示｜ESP-NOW + MPU6500 SPI</h1>
+  <div class="card">
+    <div class="row">
+      <button onclick="zeroPose()">姿態歸零</button>
+      <button onclick="calGyro()">琴桶陀螺儀重校正</button>
+      <button onclick="resetView()">視角重置</button>
+      <span class="pill">完全離線：無 CDN、無 Three.js 外部連線</span>
+      <span class="pill">GLB：/erhu_body.glb + /erhu_bow.glb</span>
+      <span class="pill warn">MPU6500 無磁力計，Yaw 會慢慢漂移</span>
+    </div>
+    <div class="small" style="margin-top:8px">這版仍然讀取 GLB 模型，但不需要網際網路。ESP32 LittleFS 只要有 index.html、erhu_body.glb、erhu_bow.glb，就能直接在手機瀏覽器顯示二胡與弓姿態。</div>
+  </div>
+
+  <div class="card">
+    <div class="grid">
+      <div class="kv"><div class="k">琴桶節點</div><div id="bodyOk" class="v bad">離線</div></div>
+      <div class="kv"><div class="k">弓尾節點</div><div id="bowOk" class="v bad">離線</div></div>
+      <div class="kv"><div class="k">琴桶 IMU Hz</div><div id="bodyHz" class="v">0</div></div>
+      <div class="kv"><div class="k">弓尾 ESP-NOW Hz</div><div id="bowHz" class="v">0</div></div>
+      <div class="kv"><div class="k">弓尾封包延遲</div><div id="bowAge" class="v">-</div></div>
+      <div class="kv"><div class="k">狀態</div><div id="status" class="v">啟動中</div></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div id="stage">
+      <canvas id="view"></canvas>
+      <div id="overlay">琴桶 R/P/Y：-<br>弓尾 R/P/Y：-</div>
+      <div id="loadMsg">正在載入 LittleFS 內的 GLB 模型...</div>
+    </div>
+    <div class="small">滑鼠或手指拖曳可以旋轉觀察視角，滾輪可以縮放。這是內建輕量 Canvas GLB renderer，專為 ESP32 離線使用，畫面效果比 Three.js 簡化，但不用網路。</div>
+  </div>
+</div>
+
+<script>
+const canvas=document.getElementById('view'),ctx=canvas.getContext('2d');
+const stage=document.getElementById('stage'),loadMsg=document.getElementById('loadMsg'),overlay=document.getElementById('overlay');
+const $=id=>document.getElementById(id); const setText=(id,v)=>{$(id).textContent=v}; const cls=(id,ok)=>{$(id).className='v '+(ok?'ok':'bad')};
+let DPR=1, bodyModel=null, bowModel=null;
+let bodyRaw=[1,0,0,0], bowRaw=[1,0,0,0], bodyZero=[1,0,0,0], bowZero=[1,0,0,0], haveZero=false;
+let bodyQ=[1,0,0,0], bowQ=[1,0,0,0], bowPos=[1.95,-0.12,0.25], bowPosTarget=[1.95,-0.12,0.25];
+let viewYaw=-0.46, viewPitch=0.18, zoom=1.35, dragging=false,lastX=0,lastY=0;
+function qNorm(q){let n=Math.hypot(q[0],q[1],q[2],q[3])||1;return [q[0]/n,q[1]/n,q[2]/n,q[3]/n]}
+function qConj(q){return [q[0],-q[1],-q[2],-q[3]]}
+function qMul(a,b){return [a[0]*b[0]-a[1]*b[1]-a[2]*b[2]-a[3]*b[3],a[0]*b[1]+a[1]*b[0]+a[2]*b[3]-a[3]*b[2],a[0]*b[2]-a[1]*b[3]+a[2]*b[0]+a[3]*b[1],a[0]*b[3]+a[1]*b[2]-a[2]*b[1]+a[3]*b[0]]}
+function qDot(a,b){return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]+a[3]*b[3]}
+function qSlerp(a,b,t){a=qNorm(a);b=qNorm(b);let d=qDot(a,b);if(d<0){b=b.map(v=>-v);d=-d} if(d>0.9995)return qNorm(a.map((v,i)=>v+(b[i]-v)*t));let th=Math.acos(Math.max(-1,Math.min(1,d))),s=Math.sin(th);return a.map((v,i)=>(Math.sin((1-t)*th)*v+Math.sin(t*th)*b[i])/s)}
+function qRot(q,v){q=qNorm(q);let w=q[0],x=q[1],y=q[2],z=q[3],vx=v[0],vy=v[1],vz=v[2];let tx=2*(y*vz-z*vy),ty=2*(z*vx-x*vz),tz=2*(x*vy-y*vx);return [vx+w*tx+(y*tz-z*ty),vy+w*ty+(z*tx-x*tz),vz+w*tz+(x*ty-y*tx)]}
+function qEuler(q){q=qNorm(q);let w=q[0],x=q[1],y=q[2],z=q[3];let r=Math.atan2(2*(w*x+y*z),1-2*(x*x+y*y));let sp=2*(w*y-z*x);let p=Math.asin(Math.max(-1,Math.min(1,sp)));let yw=Math.atan2(2*(w*z+x*y),1-2*(y*y+z*z));return [r,p,yw].map(a=>a*180/Math.PI)}
+function relBody(){return haveZero?qMul(bodyZero,bodyRaw):bodyRaw} function relBow(){return haveZero?qMul(bowZero,bowRaw):bowRaw}
+function rgbaFromFactor(f,shade=1){let r=Math.max(0,Math.min(255,Math.round((f?.[0]??0.8)*255*shade))),g=Math.max(0,Math.min(255,Math.round((f?.[1]??0.8)*255*shade))),b=Math.max(0,Math.min(255,Math.round((f?.[2]??0.8)*255*shade))),a=f?.[3]??1;return `rgba(${r},${g},${b},${a})`}
+async function loadGLB(url){
+  const ab=await (await fetch(url)).arrayBuffer(); const dv=new DataView(ab);
+  if(dv.getUint32(0,true)!==0x46546c67)throw new Error('not GLB');
+  let off=12,json=null,bin=null;
+  while(off<ab.byteLength){let len=dv.getUint32(off,true),type=dv.getUint32(off+4,true);off+=8;let chunk=ab.slice(off,off+len);off+=len;if(type===0x4E4F534A)json=JSON.parse(new TextDecoder().decode(chunk).replace(/\0+$/,'')); if(type===0x004E4942)bin=chunk;}
+  if(!json||!bin)throw new Error('GLB chunks missing');
+  const bdv=new DataView(bin), comps={5126:{size:4,read:(o)=>bdv.getFloat32(o,true)},5125:{size:4,read:(o)=>bdv.getUint32(o,true)},5123:{size:2,read:(o)=>bdv.getUint16(o,true)},5121:{size:1,read:(o)=>bdv.getUint8(o)}};
+  const nComp={SCALAR:1,VEC2:2,VEC3:3,VEC4:4,MAT4:16};
+  function accessor(i){let a=json.accessors[i],bv=json.bufferViews[a.bufferView],ct=comps[a.componentType],nc=nComp[a.type],base=(bv.byteOffset||0)+(a.byteOffset||0),stride=bv.byteStride||ct.size*nc;let arr=[];for(let k=0;k<a.count;k++){let row=[];for(let c=0;c<nc;c++)row.push(ct.read(base+k*stride+c*ct.size));arr.push(nc===1?row[0]:row)}return arr}
+  let materials=(json.materials||[]).map(m=>m.pbrMetallicRoughness?.baseColorFactor||[0.8,0.8,0.8,1]);
+  let meshes=[]; for(const mesh of json.meshes||[]){for(const p of mesh.primitives||[]){if(p.mode!==undefined&&p.mode!==4)continue;let pos=accessor(p.attributes.POSITION), idx=accessor(p.indices), col=materials[p.material||0]||[0.8,0.8,0.8,1];for(let i=0;i<idx.length;i+=3)meshes.push({v:[pos[idx[i]],pos[idx[i+1]],pos[idx[i+2]]],c:col});}}
+  return meshes;
+}
+function resize(){DPR=Math.min(window.devicePixelRatio||1,2);let r=stage.getBoundingClientRect();canvas.width=Math.max(320,Math.floor(r.width*DPR));canvas.height=Math.max(300,Math.floor(r.height*DPR));ctx.setTransform(DPR,0,0,DPR,0,0);} window.addEventListener('resize',resize); resize();
+function resetView(){viewYaw=-0.46; viewPitch=0.18; zoom=1.35;} window.resetView=resetView;
+stage.addEventListener('pointerdown',e=>{dragging=true;lastX=e.clientX;lastY=e.clientY;stage.setPointerCapture(e.pointerId)});
+stage.addEventListener('pointermove',e=>{if(!dragging)return;viewYaw+=(e.clientX-lastX)*0.006;viewPitch+=(e.clientY-lastY)*0.004;viewPitch=Math.max(-1.1,Math.min(1.1,viewPitch));lastX=e.clientX;lastY=e.clientY;});
+stage.addEventListener('pointerup',()=>dragging=false);
+stage.addEventListener('wheel',e=>{e.preventDefault();zoom*=e.deltaY>0?0.92:1.08;zoom=Math.max(0.65,Math.min(2.8,zoom));},{passive:false});
+function project(p){let cy=Math.cos(viewYaw),sy=Math.sin(viewYaw),cp=Math.cos(viewPitch),sp=Math.sin(viewPitch);let x=p[0],y=p[1],z=p[2];let x1=x*cy-z*sy,z1=x*sy+z*cy;let y1=y*cp-z1*sp,z2=y*sp+z1*cp;let W=canvas.width/DPR,H=canvas.height/DPR,dist=6.2,s=(H*0.76*zoom)/(dist+z2);return [W/2+x1*s,H*0.52-y1*s,z2,s]}
+function normal(a,b,c){let ux=b[0]-a[0],uy=b[1]-a[1],uz=b[2]-a[2],vx=c[0]-a[0],vy=c[1]-a[1],vz=c[2]-a[2];let nx=uy*vz-uz*vy,ny=uz*vx-ux*vz,nz=ux*vy-uy*vx,n=Math.hypot(nx,ny,nz)||1;return [nx/n,ny/n,nz/n]}
+function addModel(draws,model,q,scale,pos){if(!model)return;let light=qNorm([0,0.35,-0.65,0.68]);let lightV=[0.35,-0.65,0.68];for(const tri of model){let w=tri.v.map(v=>{let p=qRot(q,[v[0]*scale,v[1]*scale,v[2]*scale]);return [p[0]+pos[0],p[1]+pos[1],p[2]+pos[2]]});let n=normal(w[0],w[1],w[2]);let shade=0.58+0.42*Math.max(0,n[0]*lightV[0]+n[1]*lightV[1]+n[2]*lightV[2]);let pp=w.map(project);let area=(pp[1][0]-pp[0][0])*(pp[2][1]-pp[0][1])-(pp[1][1]-pp[0][1])*(pp[2][0]-pp[0][0]);if(Math.abs(area)<0.05)continue;draws.push({p:pp,z:(pp[0][2]+pp[1][2]+pp[2][2])/3,c:rgbaFromFactor(tri.c,shade),stroke:rgbaFromFactor(tri.c,Math.max(0.25,shade*0.62))});}}
+function drawGrid(){let W=canvas.width/DPR,H=canvas.height/DPR;ctx.strokeStyle='rgba(43,64,91,.45)';ctx.lineWidth=1;for(let i=-5;i<=5;i++){for(const line of [[[i,-2.05,-2.8],[i,-2.05,2.8]],[[-2.8,-2.05,i],[2.8,-2.05,i]]]){let a=project(line[0]),b=project(line[1]);ctx.beginPath();ctx.moveTo(a[0],a[1]);ctx.lineTo(b[0],b[1]);ctx.stroke();}}}
+function drawAxes(){let o=project([-2.2,-1.72,0]),x=project([-1.55,-1.72,0]),y=project([-2.2,-1.07,0]),z=project([-2.2,-1.72,0.65]);ctx.lineWidth=3;for(const [p,col,txt] of [[x,'#ff6b6b','X'],[y,'#42d392','Y'],[z,'#80bfff','Z']]){ctx.strokeStyle=col;ctx.fillStyle=col;ctx.beginPath();ctx.moveTo(o[0],o[1]);ctx.lineTo(p[0],p[1]);ctx.stroke();ctx.fillText(txt,p[0]+4,p[1]+4)}}
+function render(){requestAnimationFrame(render);let W=canvas.width/DPR,H=canvas.height/DPR;ctx.clearRect(0,0,W,H);ctx.fillStyle='#06101b';ctx.fillRect(0,0,W,H);drawGrid();bodyQ=qSlerp(bodyQ,relBody(),0.32);bowQ=qSlerp(bowQ,relBow(),0.32);bowPosTarget=qRot(bodyQ,[1.18,-0.10,0.16]).map(v=>v*1.65);for(let i=0;i<3;i++)bowPos[i]+=0.35*(bowPosTarget[i]-bowPos[i]);let draws=[];addModel(draws,bodyModel,bodyQ,1.65,[0,0,0]);addModel(draws,bowModel,bowQ,1.65,bowPos);draws.sort((a,b)=>b.z-a.z);for(const d of draws){ctx.beginPath();ctx.moveTo(d.p[0][0],d.p[0][1]);ctx.lineTo(d.p[1][0],d.p[1][1]);ctx.lineTo(d.p[2][0],d.p[2][1]);ctx.closePath();ctx.fillStyle=d.c;ctx.fill();ctx.strokeStyle=d.stroke;ctx.lineWidth=.55;ctx.stroke();}drawAxes();let eb=qEuler(relBody()),ew=qEuler(relBow());overlay.innerHTML=`琴桶 R/P/Y：${eb[0].toFixed(0)} / ${eb[1].toFixed(0)} / ${eb[2].toFixed(0)}°<br>弓尾 R/P/Y：${ew[0].toFixed(0)} / ${ew[1].toFixed(0)} / ${ew[2].toFixed(0)}°`;}
+window.zeroPose=()=>{bodyZero=qConj(bodyRaw);bowZero=qConj(bowRaw);haveZero=true;setText('status','已歸零')};
+window.calGyro=async()=>{if(!confirm('琴桶節點請保持靜止約 2 秒。確定要重校正？'))return;setText('status','校正中');try{const r=await fetch('/calgyro');setText('status',r.ok?'琴桶校正完成':'校正失敗')}catch(e){setText('status','校正失敗')}};
+async function poll(){try{const r=await fetch('/pose');const j=await r.json();bodyRaw=[j.body.qw,j.body.qx,j.body.qy,j.body.qz];bowRaw=[j.bow.qw,j.bow.qx,j.bow.qy,j.bow.qz];setText('bodyOk',j.body.ok?'在線':'離線');cls('bodyOk',j.body.ok);setText('bowOk',j.bow.ok?'在線':'離線');cls('bowOk',j.bow.ok);setText('bodyHz',j.body.hz);setText('bowHz',j.bow.hz);setText('bowAge',j.bow.age_ms+' ms');if(!haveZero)setText('status','請放好起始姿勢後按姿態歸零')}catch(e){setText('status','網頁連線中斷')}}
+(async()=>{try{[bodyModel,bowModel]=await Promise.all([loadGLB('/erhu_body.glb'),loadGLB('/erhu_bow.glb')]);loadMsg.style.display='none';setText('status','離線 GLB 模型已載入，請歸零');render();setInterval(poll,25);poll();}catch(e){console.error(e);loadMsg.innerHTML='GLB 載入失敗。<br>請確認 LittleFS 已上傳 index.html、erhu_body.glb、erhu_bow.glb。<br><br>'+e.message;}})();
+</script>
+</body>
+</html>
