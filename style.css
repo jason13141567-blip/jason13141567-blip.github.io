@@ -10,6 +10,22 @@ body {
   line-height: 1.9;
 }
 
+.trial-badge {
+  position: fixed;
+  left: 12px;
+  top: 50%;
+  transform: translateY(-50%) rotate(-90deg);
+  transform-origin: center;
+  z-index: 100;
+  padding: 6px 10px;
+  border: 1px solid #c9ad97;
+  border-radius: 6px;
+  background-color: rgba(245, 245, 240, 0.95);
+  color: #5d4037;
+  font-size: 13px;
+  letter-spacing: 3px;
+}
+
 .nav {
   position: fixed;
   top: 16px;
